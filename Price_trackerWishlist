@@ -1,0 +1,317 @@
+import os
+import re
+import json
+import requests
+import tkinter as tk
+from tkinter import messagebox, simpledialog
+from dotenv import load_dotenv
+from twilio.rest import Client
+from flask import Flask, request, redirect, url_for, render_template_string
+import threading
+import schedule
+import time
+
+# ---------------------------
+# Suppress macOS Tk warning
+# ---------------------------
+os.environ["TK_SILENCE_DEPRECATION"] = "1"
+
+# ---------------------------
+# Load secrets from .env
+# ---------------------------
+load_dotenv()
+TWILIO_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH = os.getenv("TWILIO_AUTH_TOKEN")
+FROM_WHATSAPP = os.getenv("TWILIO_FROM_PHONE")
+TO_WHATSAPP = os.getenv("TWILIO_TO_PHONE")
+
+client = Client(TWILIO_SID, TWILIO_AUTH)
+
+# ---------------------------
+# Data file
+# ---------------------------
+DATA_FILE = "games.json"
+game_ids = []
+
+# ---------------------------
+# JSON Helpers
+# ---------------------------
+def load_games():
+    global game_ids
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "r") as f:
+            try:
+                data = json.load(f)
+                if isinstance(data, list):
+                    game_ids = data
+                elif isinstance(data, dict) and "games" in data:
+                    game_ids = data["games"]
+                else:
+                    game_ids = []
+            except json.JSONDecodeError:
+                game_ids = []
+    else:
+        game_ids = []
+
+def save_games():
+    with open(DATA_FILE, "w") as f:
+        json.dump(game_ids, f, indent=2)
+
+# ---------------------------
+# Steam API Helpers
+# ---------------------------
+def extract_appid(input_str):
+    """Extract Steam AppID from AppID, game page link, or search link."""
+    input_str = input_str.strip()
+
+    # Case 1: Direct AppID
+    if input_str.isdigit():
+        return input_str
+
+    # Case 2: Game page link
+    match = re.search(r"store\.steampowered\.com/app/(\d+)", input_str)
+    if match:
+        return match.group(1)
+
+    # Case 3: Search link
+    if "store.steampowered.com/search" in input_str:
+        try:
+            headers = {"User-Agent": "Mozilla/5.0"}
+            res = requests.get(input_str, headers=headers, timeout=10)
+            html = res.text
+            match = re.search(r"data-ds-appid=\"(\d+)\"", html)
+            if match:
+                return match.group(1)
+        except Exception as e:
+            print(f"❌ Search parsing failed: {e}")
+            return None
+
+    return None
+
+def get_game_name(appid):
+    url = f"https://store.steampowered.com/api/appdetails?appids={appid}&filters=basic"
+    try:
+        response = requests.get(url, timeout=10).json()
+        if response[str(appid)]["success"]:
+            return response[str(appid)]["data"]["name"]
+    except Exception:
+        return None
+    return None
+
+def get_price(appid, country="us"):
+    url = f"https://store.steampowered.com/api/appdetails?appids={appid}&cc={country}&filters=price_overview"
+    try:
+        response = requests.get(url, timeout=10).json()
+        if not response or not response[str(appid)]["success"]:
+            return None, None
+        price_info = response[str(appid)]["data"].get("price_overview")
+        if not price_info:
+            return "Free", 0
+        return price_info["final_formatted"], price_info["discount_percent"]
+    except Exception:
+        return None, None
+
+# ---------------------------
+# WhatsApp sender
+# ---------------------------
+def send_whatsapp(body):
+    try:
+        message = client.messages.create(
+            from_=FROM_WHATSAPP,
+            to=TO_WHATSAPP,
+            body=body
+        )
+        print(f"✅ WhatsApp sent: {message.sid}")
+    except Exception as e:
+        print(f"❌ WhatsApp failed: {e}")
+
+# ---------------------------
+# Tkinter GUI Functions
+# ---------------------------
+def add_game():
+    raw_input = simpledialog.askstring("Add Game", "Enter Steam AppID or link:")
+    if raw_input:
+        appid = extract_appid(raw_input)
+        if not appid:
+            messagebox.showerror("Error", "Invalid input. Enter AppID, game link, or search link.")
+            return
+        appid = str(appid).strip()
+        name = get_game_name(appid)
+        if name:
+            if appid not in game_ids:
+                game_ids.append(appid)
+                save_games()
+                listbox.insert(tk.END, f"{appid} - {name}")
+            else:
+                messagebox.showinfo("Info", f"{name} is already being tracked.")
+        else:
+            messagebox.showerror("Error", f"AppID {appid} not found.")
+
+def remove_game():
+    selection = listbox.curselection()
+    if not selection:
+        messagebox.showwarning("No Selection", "Please select a game to remove.")
+        return
+    index = selection[0]
+    entry = listbox.get(index)
+    appid = entry.split(" - ")[0]
+    if appid in game_ids:
+        game_ids.remove(appid)
+        save_games()
+    listbox.delete(index)
+
+def reload_games():
+    listbox.delete(0, tk.END)
+    load_games()
+    for appid in game_ids:
+        name = get_game_name(appid)
+        if name:
+            listbox.insert(tk.END, f"{appid} - {name}")
+
+def check_prices(send_alert=True):
+    if not game_ids:
+        if send_alert:
+            messagebox.showwarning("No Games", "Please add at least one game ID first.")
+        return
+
+    results = []
+    discounted = []
+    for appid in game_ids:
+        price, discount = get_price(appid)
+        name = get_game_name(appid) or appid
+        if price is None:
+            results.append(f"{name}: ❌ Not found")
+        else:
+            results.append(f"{name}: {price} ({discount}% off)")
+            if discount and discount >= 10:
+                discounted.append(f"{name} is {discount}% off! Now {price}")
+
+    if results and send_alert:
+        messagebox.showinfo("Price Check Results", "\n".join(results))
+
+    if discounted:
+        send_whatsapp("🔥 Deals:\n" + "\n".join(discounted))
+
+# ---------------------------
+# Scheduler Thread
+# ---------------------------
+def scheduler_loop():
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
+
+def set_auto_check(interval=30):
+    schedule.every(interval).minutes.do(lambda: check_prices(send_alert=False))
+
+# ---------------------------
+# Tkinter GUI
+# ---------------------------
+root = tk.Tk()
+root.title("Steam Price Tracker")
+
+frame = tk.Frame(root, padx=10, pady=10)
+frame.pack()
+
+listbox = tk.Listbox(frame, width=50, height=10)
+listbox.pack()
+
+btn_add = tk.Button(frame, text="➕ Add Game", command=add_game)
+btn_add.pack(pady=5)
+
+btn_remove = tk.Button(frame, text="🗑 Remove Game", command=remove_game)
+btn_remove.pack(pady=5)
+
+btn_check = tk.Button(frame, text="💰 Check Prices", command=check_prices)
+btn_check.pack(pady=5)
+
+btn_reload = tk.Button(frame, text="🔄 Reload Games", command=reload_games)
+btn_reload.pack(pady=5)
+
+# ---------------------------
+# Flask Web Interface
+# ---------------------------
+app = Flask(__name__)
+
+TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head><title>Steam Price Tracker</title></head>
+<body>
+<h1>Steam Price Tracker (Web)</h1>
+<h2>Tracked Games</h2>
+<ul>
+{% for appid, name in games %}
+  <li>{{appid}} - {{name}}
+    <form action="/remove" method="post" style="display:inline;">
+      <input type="hidden" name="appid" value="{{appid}}">
+      <input type="submit" value="Remove">
+    </form>
+  </li>
+{% endfor %}
+</ul>
+
+<h2>Add Game</h2>
+<form action="/add" method="post">
+  <input type="text" name="appid" placeholder="AppID or Steam link" required>
+  <input type="submit" value="Add">
+</form>
+
+<form action="/check" method="post">
+  <button type="submit">💰 Check Prices</button>
+</form>
+</body>
+</html>
+"""
+
+@app.route("/")
+def index():
+    load_games()
+    games_display = []
+    for appid in game_ids:
+        name = get_game_name(appid) or f"Unknown ({appid})"
+        games_display.append((appid, name))
+    return render_template_string(TEMPLATE, games=games_display)
+
+@app.route("/add", methods=["POST"])
+def add_game_web():
+    raw_input = request.form.get("appid")
+    appid = extract_appid(raw_input)
+    if appid:
+        appid = str(appid).strip()
+        name = get_game_name(appid)
+        if name and appid not in game_ids:
+            game_ids.append(appid)
+            save_games()
+    return redirect(url_for("index"))
+
+@app.route("/remove", methods=["POST"])
+def remove_game_web():
+    appid = request.form.get("appid")
+    if appid in game_ids:
+        game_ids.remove(appid)
+        save_games()
+    return redirect(url_for("index"))
+
+@app.route("/check", methods=["POST"])
+def check_web():
+    check_prices(send_alert=False)
+    return redirect(url_for("index"))
+
+# ---------------------------
+# Threads
+# ---------------------------
+def run_flask():
+    app.run(host="0.0.0.0", port=5002, debug=False, use_reloader=False)
+
+# Start Flask in background
+threading.Thread(target=run_flask, daemon=True).start()
+
+# Start scheduler in background
+set_auto_check(30)  # every 30 min
+threading.Thread(target=scheduler_loop, daemon=True).start()
+
+# Load saved games at startup
+load_games()
+reload_games()
+
+root.mainloop()
